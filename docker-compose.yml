@@ -1,0 +1,11 @@
+services:
+  weclapp-api-knowledge-mcp:
+    build: .
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    environment:
+      MCP_TRANSPORT: sse
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: 8080
