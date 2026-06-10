@@ -9,4 +9,3 @@ build
 *.egg-info
 .env
 .env.*
-knowledge/*.json

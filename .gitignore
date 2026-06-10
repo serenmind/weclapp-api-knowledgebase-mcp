@@ -9,5 +9,3 @@ __pycache__/
 dist/
 build/
 *.egg-info/
-knowledge/*.json
-!knowledge/.gitkeep

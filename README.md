@@ -155,13 +155,7 @@ More client examples: [docs/CLIENT_SETUP.md](docs/CLIENT_SETUP.md).
 
 ## Refreshing the OpenAPI spec
 
-Replace `data/openapi_v2.json` with an updated weclapp v2 OpenAPI export, then restart the server. To export pre-built index JSON for inspection:
-
-```bash
-uv run weclapp-build-indexes
-```
-
-This writes optional artifacts to `knowledge/`; the MCP server reads the OpenAPI file directly at runtime.
+Replace `data/openapi_v2.json` with an updated weclapp v2 OpenAPI export, then restart the server. The MCP server reads and caches the spec directly at runtime.
 
 ## Development
 

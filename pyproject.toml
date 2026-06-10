@@ -34,7 +34,6 @@ dev = [
 
 [project.scripts]
 weclapp-api-knowledge-mcp = "weclapp_api_knowledge_mcp.server:main"
-weclapp-build-indexes = "weclapp_api_knowledge_mcp.build_indexes:main"
 
 [build-system]
 requires = ["hatchling"]
