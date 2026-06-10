@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import Counter
 from typing import Any
 
-from weclapp_api_knowledge_mcp.knowledge.openapi_loader import field_info
+from weclapp_api_knowledge_mcp.knowledge.openapi_loader import field_info, resolve_entity_name
 
 
 def _payload(response: Any) -> Any:
@@ -70,6 +70,7 @@ def analyze_response_structure(response: Any) -> dict[str, Any]:
 
 
 def compare_to_schema(entity: str, response: Any) -> dict[str, Any]:
+    entity = resolve_entity_name(entity)
     payload = _payload(response)
     if isinstance(payload, dict) and "result" in payload:
         result = payload["result"]

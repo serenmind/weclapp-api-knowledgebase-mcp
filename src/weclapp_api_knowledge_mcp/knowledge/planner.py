@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 from typing import Any
 
 from weclapp_api_knowledge_mcp.knowledge.openapi_loader import (
@@ -8,36 +7,55 @@ from weclapp_api_knowledge_mcp.knowledge.openapi_loader import (
     TEXT_SEARCH_HINTS,
     entity_summary,
     field_info,
+    normalize_tokens,
     relationship_graph,
+    resolve_entity_name,
+    significant_tokens,
 )
+
+# Domain synonyms mapping goal vocabulary to schema vocabulary.
+_ALIASES: dict[str, set[str]] = {
+    "customer": {"customer", "party"},
+    "supplier": {"supplier", "party"},
+    "vendor": {"supplier", "party"},
+    "product": {"article"},
+    "item": {"article", "item"},
+    "user": {"user", "creator", "responsible"},
+    "warehouse": {"warehouse", "storage"},
+    "delivery": {"shipment", "delivery"},
+}
 
 
 def _tokenize(text: str) -> set[str]:
-    return set(re.findall(r"[a-zA-Z][a-zA-Z0-9_]+", text.lower()))
+    return significant_tokens(text)
 
 
 def _relationship_relevance(rel: dict[str, Any], tokens: set[str], needs: list[str]) -> int:
-    haystack = f"{rel['path']} {rel['target_entity']}".lower()
-    score = sum(1 for token in tokens if token in haystack)
-    score += sum(2 for need in needs if need.lower() in haystack)
-    if not rel.get("nested"):
-        score += 2
-    common_words = {
-        "customer": ["customer", "party"],
-        "supplier": ["supplier", "party"],
-        "article": ["article"],
-        "unit": ["unit"],
-        "user": ["user", "creator", "responsible"],
-        "shipment": ["shipment"],
-        "invoice": ["invoice"],
-        "quotation": ["quotation"],
-        "order": ["order"],
-    }
-    for word, aliases in common_words.items():
-        if word in tokens and any(alias in haystack for alias in aliases):
+    target_words = set(normalize_tokens(rel["target_entity"]))
+    leaf_words = set(normalize_tokens(rel["field"]))
+    strong_words = target_words | leaf_words
+    # Words from intermediate path segments (e.g. "orderItems" in
+    # orderItems[].picks[].x) are structural and only weak evidence.
+    path_words = set(normalize_tokens(rel["path"])) - strong_words
+
+    score = 3 * len(tokens & strong_words)
+    score += len(tokens & path_words)
+
+    for need in needs:
+        need_words = _tokenize(need)
+        rel_words = strong_words | path_words
+        if need_words and need_words <= rel_words:
+            score += 6
+        elif need_words & rel_words:
+            score += 2
+
+    for token in tokens:
+        aliases = _ALIASES.get(token)
+        if aliases and aliases & strong_words:
             score += 3
-            if not rel.get("nested"):
-                score += 2
+
+    if score and not rel.get("nested"):
+        score += 2
     return score
 
 
@@ -47,22 +65,35 @@ def plan_cross_entity_read(
     root_id: str | None = None,
     needs: list[str] | None = None,
 ) -> dict[str, Any]:
+    root_entity = resolve_entity_name(root_entity)
     needs = needs or []
     tokens = _tokenize(goal + " " + " ".join(needs))
     summary = entity_summary(root_entity)
     fields = field_info(root_entity)
     relationships = relationship_graph().get(root_entity, [])
 
+    # Root-entity words describe the root itself ("sales order ..."), not
+    # relationship targets; keeping them floods nested paths with false hits.
+    relationship_tokens = tokens - set(normalize_tokens(root_entity))
+
     scored = []
     for rel in relationships:
-        score = _relationship_relevance(rel, tokens, needs)
-        if score > 0:
+        score = _relationship_relevance(rel, relationship_tokens, needs)
+        # Require at least one strong (target/leaf-field) match; a lone
+        # structural path word is not evidence the goal needs this reference.
+        if score >= 3:
             scored.append((score, rel))
     scored.sort(key=lambda item: (item[0], not item[1].get("nested")), reverse=True)
     selected = [rel for _, rel in scored[:8]]
+    if not selected:
+        # Vague goal: default to top-level references so one call still resolves them.
+        selected = [rel for rel in relationships if not rel.get("nested")][:8]
 
     requested_fields = set(COMMON_ENTITY_FIELDS.get(root_entity, ["id"]))
-    requested_fields.update(field for field in fields if field.lower() in tokens)
+    for field in fields:
+        field_words = set(normalize_tokens(field))
+        if field.lower() in tokens or (field_words and field_words <= tokens):
+            requested_fields.add(field)
     for rel in selected:
         top_level = rel["path"].split(".")[0].replace("[]", "")
         if top_level in fields:

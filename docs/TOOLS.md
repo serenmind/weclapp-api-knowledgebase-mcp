@@ -1,5 +1,11 @@
 # Tools
 
+Input conventions:
+
+- Entity names are resolved tolerantly: `salesOrder`, `SalesOrder`, `sales-order`, `sales_orders`, and `sales orders` all resolve to the canonical `salesOrder`. Unknown names raise an error with close-match suggestions.
+- Endpoint paths accept concrete values in parameterized segments: `/salesOrder/id/12345` resolves to `/salesOrder/id/{id}`.
+- Field paths may be nested and are validated through the schema graph, e.g. `orderItems.articleId`.
+
 ## Knowledge
 
 `search_knowledge(query, limit=10)` searches entities, fields, endpoints, and relationships.

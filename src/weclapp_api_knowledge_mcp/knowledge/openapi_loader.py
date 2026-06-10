@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import difflib
 import json
+import re
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -49,6 +51,49 @@ COMMON_ENTITY_FIELDS = {
     "purchaseInvoice": ["id", "invoiceNumber", "supplierId", "status", "purchaseOrderId"],
     "shipment": ["id", "shipmentNumber", "mainSalesOrderId", "recipientPartyId", "status"],
 }
+
+
+_WORD_RE = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|\d+")
+
+
+def split_words(name: str) -> list[str]:
+    """Split camelCase/snake_case/path-like identifiers into lowercase words."""
+    return [word.lower() for chunk in re.split(r"[^a-zA-Z0-9]+", name) for word in _WORD_RE.findall(chunk)]
+
+
+def singularize(word: str) -> str:
+    """Cheap English singularization good enough for API identifiers."""
+    if len(word) > 3 and word.endswith("ies"):
+        return word[:-3] + "y"
+    if len(word) > 4 and word.endswith(("ses", "xes", "zes", "ches", "shes")):
+        return word[:-2]
+    if len(word) > 3 and word.endswith("s") and not word.endswith("ss"):
+        return word[:-1]
+    return word
+
+
+def normalize_tokens(text: str) -> list[str]:
+    """Tokenize free text or identifiers into singular lowercase words."""
+    return [singularize(word) for word in split_words(text)]
+
+
+# Function words that carry no signal when ranking API identifiers.
+# Tokens are singularized before lookup, hence forms like "doe" (does) and "ha" (has).
+STOPWORDS = {
+    "a", "all", "an", "and", "are", "by", "can", "doe", "do", "for", "from",
+    "get", "ha", "have", "how", "i", "in", "is", "it", "its", "me", "my",
+    "of", "on", "or", "that", "the", "their", "this", "to", "via", "want",
+    "we", "what", "when", "where", "which", "who", "with", "you",
+}
+
+
+def significant_tokens(text: str) -> set[str]:
+    """Normalized tokens with stopwords and single letters removed."""
+    return {token for token in normalize_tokens(text) if len(token) > 1 and token not in STOPWORDS}
+
+
+def compact(text: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", text.lower())
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -101,7 +146,17 @@ def resolve_schema_node(spec: dict[str, Any], node: dict[str, Any]) -> dict[str,
 
 
 def entity_names(spec: dict[str, Any] | None = None) -> list[str]:
-    spec = spec or load_spec()
+    if spec is None:
+        return _entity_names_cached()
+    return _entity_names(spec)
+
+
+@lru_cache(maxsize=1)
+def _entity_names_cached() -> list[str]:
+    return _entity_names(load_spec())
+
+
+def _entity_names(spec: dict[str, Any]) -> list[str]:
     entities = set()
     for path in spec.get("paths", {}):
         first = path.strip("/").split("/")[0]
@@ -110,8 +165,46 @@ def entity_names(spec: dict[str, Any] | None = None) -> list[str]:
     return sorted(entities)
 
 
+def resolve_entity_name(entity: str) -> str:
+    """Resolve a user-provided entity name to the canonical OpenAPI name.
+
+    Tolerates casing, separators (sales-order, sales_order, "sales order"),
+    and plural forms. Raises ValueError with suggestions when unresolvable.
+    """
+    names = entity_names()
+    if entity in names:
+        return entity
+    by_compact = {compact(name): name for name in names}
+    key = compact(entity)
+    if key in by_compact:
+        return by_compact[key]
+    # Normalize plurals on both sides: "sales_orders" and "salesOrder" both
+    # reduce to "saleorder".
+    by_singular = {"".join(normalize_tokens(name)): name for name in names}
+    singular_key = "".join(normalize_tokens(entity))
+    if singular_key in by_singular:
+        return by_singular[singular_key]
+    suggestions = difflib.get_close_matches(key, by_compact.keys(), n=5, cutoff=0.6)
+    suggested_names = [by_compact[s] for s in suggestions]
+    raise ValueError(
+        f"Unknown weclapp entity '{entity}'."
+        + (f" Did you mean: {', '.join(suggested_names)}?" if suggested_names else "")
+        + " Use search_knowledge to discover entity names."
+    )
+
+
 def build_endpoint_catalog(spec: dict[str, Any] | None = None) -> dict[str, list[dict[str, Any]]]:
-    spec = spec or load_spec()
+    if spec is None:
+        return _endpoint_catalog_cached()
+    return _build_endpoint_catalog(spec)
+
+
+@lru_cache(maxsize=1)
+def _endpoint_catalog_cached() -> dict[str, list[dict[str, Any]]]:
+    return _build_endpoint_catalog(load_spec())
+
+
+def _build_endpoint_catalog(spec: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
     catalog: dict[str, list[dict[str, Any]]] = {}
     for path, operations in spec.get("paths", {}).items():
         parts = path.strip("/").split("/")
@@ -146,7 +239,17 @@ def build_endpoint_catalog(spec: dict[str, Any] | None = None) -> dict[str, list
 
 
 def field_info(entity: str, spec: dict[str, Any] | None = None) -> dict[str, dict[str, Any]]:
-    spec = spec or load_spec()
+    if spec is None:
+        return _field_info_cached(entity)
+    return _field_info(entity, spec)
+
+
+@lru_cache(maxsize=None)
+def _field_info_cached(entity: str) -> dict[str, dict[str, Any]]:
+    return _field_info(entity, load_spec())
+
+
+def _field_info(entity: str, spec: dict[str, Any]) -> dict[str, dict[str, Any]]:
     schema = resolve_schema(spec, entity)
     fields: dict[str, dict[str, Any]] = {}
     for name, prop in schema.get("properties", {}).items():
@@ -215,7 +318,17 @@ def _walk_relationships(
 
 
 def relationship_graph(spec: dict[str, Any] | None = None) -> dict[str, list[dict[str, Any]]]:
-    spec = spec or load_spec()
+    if spec is None:
+        return _relationship_graph_cached()
+    return _relationship_graph(spec)
+
+
+@lru_cache(maxsize=1)
+def _relationship_graph_cached() -> dict[str, list[dict[str, Any]]]:
+    return _relationship_graph(load_spec())
+
+
+def _relationship_graph(spec: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
     graph: dict[str, list[dict[str, Any]]] = {}
     for entity in entity_names(spec):
         if entity not in spec.get("components", {}).get("schemas", {}):
@@ -227,7 +340,6 @@ def relationship_graph(spec: dict[str, Any] | None = None) -> dict[str, list[dic
 
 
 def entity_summary(entity: str, spec: dict[str, Any] | None = None) -> dict[str, Any]:
-    spec = spec or load_spec()
     endpoints = build_endpoint_catalog(spec).get(entity, [])
     fields = field_info(entity, spec)
     relationships = relationship_graph(spec).get(entity, [])
@@ -259,5 +371,39 @@ def normalize_properties(entity: str, requested: list[str] | None = None) -> lis
 
 
 def known_entities_or_raise(entity: str) -> None:
-    if entity not in entity_names():
-        raise ValueError(f"Unknown weclapp entity '{entity}'. Use search_knowledge first.")
+    resolve_entity_name(entity)
+
+
+_ARRAY_TYPE_RE = re.compile(r"array\[(\w+)\]")
+
+
+def resolve_field_path(entity: str, field_path: str) -> dict[str, Any]:
+    """Walk a dotted field path (e.g. orderItems.articleId) through OpenAPI schemas.
+
+    Follows array item schemas and referenced schema types so nested paths can be
+    validated precisely instead of only checking the top-level field.
+    """
+    segments = [segment.replace("[]", "") for segment in field_path.split(".") if segment]
+    current_schema = entity
+    walked: list[dict[str, Any]] = []
+    for segment in segments:
+        fields = field_info(current_schema)
+        info = fields.get(segment)
+        if info is None:
+            suggestions = difflib.get_close_matches(segment, fields.keys(), n=5, cutoff=0.6)
+            return {
+                "resolved": False,
+                "failed_at": segment,
+                "failed_in_schema": current_schema,
+                "walked": walked,
+                "suggestions": suggestions,
+            }
+        walked.append({"schema": current_schema, "field": segment, "type": info["type"]})
+        field_type = info["type"] or ""
+        array_match = _ARRAY_TYPE_RE.fullmatch(field_type)
+        current_schema = array_match.group(1) if array_match else field_type
+    return {
+        "resolved": True,
+        "walked": walked,
+        "leaf_type": walked[-1]["type"] if walked else None,
+    }

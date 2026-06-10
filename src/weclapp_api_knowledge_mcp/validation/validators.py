@@ -1,9 +1,20 @@
 from __future__ import annotations
 
+import difflib
 from typing import Any
 
 from weclapp_api_knowledge_mcp.analysis.structure import analyze_response_structure
-from weclapp_api_knowledge_mcp.knowledge.openapi_loader import FILTER_OPERATORS, field_info
+from weclapp_api_knowledge_mcp.knowledge.openapi_loader import (
+    FILTER_OPERATORS,
+    field_info,
+    resolve_entity_name,
+    resolve_field_path,
+)
+
+_STRING_OPS = {"like", "notlike", "ilike", "notilike"}
+_ORDERING_OPS = {"lt", "gt", "le", "ge"}
+_SET_OPS = {"in", "notin"}
+_NULL_OPS = {"null", "notnull"}
 
 
 def validate_read_plan(plan: dict[str, Any], response: Any) -> dict[str, Any]:
@@ -49,22 +60,49 @@ def validate_read_plan(plan: dict[str, Any], response: Any) -> dict[str, Any]:
 
 
 def validate_filter(entity: str, filters: list[dict[str, Any]]) -> dict[str, Any]:
-    fields = field_info(entity)
+    entity = resolve_entity_name(entity)
     checks = []
     for item in filters:
-        field = item.get("field")
+        field = item.get("field") or ""
         op = item.get("op", "eq")
-        checks.append(
-            {
-                "filter": item,
-                "field_known": field in fields,
-                "operator_known": op in FILTER_OPERATORS,
-                "query_param": f"{field}-{op}" if field else None,
-            }
-        )
+        value = item.get("value")
+
+        resolution = resolve_field_path(entity, field) if field else {"resolved": False, "suggestions": []}
+        leaf_type = resolution.get("leaf_type")
+        operator_known = op in FILTER_OPERATORS
+
+        warnings: list[str] = []
+        if leaf_type:
+            if op in _STRING_OPS and leaf_type != "string":
+                warnings.append(f"Operator '{op}' targets string fields; '{field}' is type '{leaf_type}'.")
+            if op in _ORDERING_OPS and leaf_type == "boolean":
+                warnings.append(f"Ordering operator '{op}' makes no sense for boolean field '{field}'.")
+        if op in _SET_OPS and not isinstance(value, (list, str)):
+            warnings.append('in/notin expects a JSON array value, e.g. ["1006","1007"].')
+        if op in _NULL_OPS and value not in (None, ""):
+            warnings.append(f"Operator '{op}' takes no value; drop the value for '{field}'.")
+        if op in _STRING_OPS and isinstance(value, str) and "%" not in value:
+            warnings.append("like/ilike without % wildcards behaves like equality; add % for contains searches.")
+
+        check: dict[str, Any] = {
+            "filter": item,
+            "field_known": bool(resolution.get("resolved")),
+            "field_type": leaf_type,
+            "operator_known": operator_known,
+            "warnings": warnings,
+            "query_param": f"{field}-{op}" if field else None,
+        }
+        if not resolution.get("resolved") and resolution.get("suggestions"):
+            check["field_suggestions"] = resolution["suggestions"]
+            check["failed_at"] = resolution.get("failed_at")
+        if not operator_known:
+            check["operator_suggestions"] = difflib.get_close_matches(op, FILTER_OPERATORS, n=3, cutoff=0.5)
+        checks.append(check)
+
+    all_clean = all(c["field_known"] and c["operator_known"] and not c["warnings"] for c in checks)
     return {
         "entity": entity,
-        "verdict": "valid" if all(c["field_known"] and c["operator_known"] for c in checks) else "review",
+        "verdict": "valid" if all_clean else "review",
         "checks": checks,
         "notes": [
             "weclapp silently ignores filters for unknown or non-filterable properties in some cases; validate with probe_list_query before coding.",
@@ -94,6 +132,10 @@ def diagnose_api_error(error: dict[str, Any] | str) -> dict[str, Any]:
         diagnoses.append("Optimistic locking/version conflict. For writes, refresh the entity version before updating.")
     if status == 429 or "rate" in lower:
         diagnoses.append("Rate limiting. Reduce pageSize, add backoff, and avoid N+1 request plans.")
+    if status == 405 or "method not allowed" in lower:
+        diagnoses.append("Method not allowed. Check the endpoint with explain_endpoint; this path may not support the method.")
+    if isinstance(status, int) and status >= 500:
+        diagnoses.append("weclapp server-side error. Retry with backoff; if persistent, simplify the query (fewer includeReferencedEntities paths, smaller pageSize).")
     return {
         "status": status,
         "diagnoses": diagnoses or ["No specific pattern detected; inspect the raw response and endpoint params."],
@@ -102,11 +144,15 @@ def diagnose_api_error(error: dict[str, Any] | str) -> dict[str, Any]:
 
 
 def check_field_presence(entity: str, field_path: str, response: Any | None = None) -> dict[str, Any]:
+    entity = resolve_entity_name(entity)
     fields = field_info(entity)
     top_field = field_path.split(".")[0].replace("[]", "")
+    resolution = resolve_field_path(entity, field_path)
     result: dict[str, Any] = {
         "entity": entity,
         "field_path": field_path,
+        "openapi_path_present": bool(resolution.get("resolved")),
+        "openapi_path_resolution": resolution,
         "openapi_top_field_present": top_field in fields,
         "openapi_top_field_info": fields.get(top_field),
     }
